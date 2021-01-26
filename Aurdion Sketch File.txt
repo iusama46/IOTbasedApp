@@ -1,0 +1,285 @@
+#include <DateTime.h>
+#include <ESPDateTime.h>
+
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
+
+
+#include "ACS712.h"
+ACS712 currentSensor(ACS712_05B, 1);                                              // digital PIN 1 FOR CURRENT SENSOR
+#include <PubSubClient.h>
+#include <ESP8266WiFi.h>
+
+//////////////////////////////////////
+const char* ssid = "hasan";
+const char* password =  "hasan1234";
+const char* deviceID = "123";
+///////////////////////////////////
+
+
+static bool isStart = true;
+
+const char* mqttServer = "postman.cloudmqtt.com";
+const int mqttPort = 10196;
+const char* mqttUser = "lbgmgldq";
+const char* mqttPassword = "RI3KTzmAKpi_";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+String session_id = "00:00:00";
+
+
+#include <Filters.h> //Easy library to do the calculations
+#include <Wire.h>
+float testFrequency = 50;
+int Sensor = 3;                                                                   // PIN 3 FOR VOLTAGE SENSOR
+float intercept = -0.04; // to be adjusted based on calibration testing
+float slope = 0.0405; // to be adjusted based on calibration testing
+float current_Volts; // Voltage
+unsigned long printPeriod = 5000; //Refresh rate
+unsigned long previousMillis = 0;
+
+
+int vibr_Pin = D4;                                                                  // digital PIN 4 FOR VIBRATION SENSOR
+
+#include <max6675.h>
+
+
+int ktcSO = D7;                                                                     // digital PIN 7 FOR SO TEMPERATURE
+int ktcCS = D6;                                                                     // PIN 6 FOR CS TEMPERATURE
+int ktcCLK = D5;                                                                    // PIN 5 FOR CLK TEMPERATURE
+MAX6675 ktc(ktcCLK, ktcCS, ktcSO);
+
+
+volatile int flow_frequency; // Measures flow sensor pulses                          // PIN 2 FOR FLOW
+unsigned int l_hour; // Calculated litres/hour
+unsigned char flowsensor = D2; // Sensor Input
+unsigned long currentTime;
+unsigned long cloopTime;
+
+void ICACHE_RAM_ATTR flow () // Interrupt function
+{
+  flow_frequency++;
+}
+
+void setup()
+{
+  Serial.begin(9600);
+  WiFi.mode(WIFI_OFF);        //Prevents reconnection issue (taking too long to connect)
+  delay(1000);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print ( "\nConnecting" );
+  while ( WiFi.status() != WL_CONNECTED ) {
+    delay ( 500 );
+    Serial.print ( "." );
+  }
+
+  Serial.println("\nConnected to Network/SSID");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());  //IP address assigned to your ESP
+
+
+  DateTime.setTimeZone(+5);
+  DateTime.begin();
+
+  //Serial.println(DateTime.toISOString());
+  //Serial.println(DateTime.toUTCString());
+  delay(2000);
+
+  while (!DateTime.isTimeValid()) {
+    delay ( 500 );
+    Serial.println("Failed to get time from server.");
+    DateTime.begin();
+  }
+
+  session_id = deviceID + DateTime.format(DateFormatter::COMPAT);
+  Serial.println(session_id);
+
+  Serial.println("\nCalibrating... Ensure that no current flows through the sensor at this moment");
+  delay(100);
+  currentSensor.calibrate();
+  Serial.println("Done!");
+  pinMode(vibr_Pin, INPUT);
+
+  pinMode(flowsensor, INPUT);
+  digitalWrite(flowsensor, HIGH); // Optional Internal Pull-Up
+  attachInterrupt(0, flow, FALLING); // Setup Interrupt
+  sei(); // Enable interrupts
+  connect();
+}
+
+void loop()
+{
+  Serial.println(String(millis() / 1000 + " seconds"));
+  delay(2000);
+
+  Serial.print( "\n" );                                   //current sensor
+  float I = currentSensor.getCurrentAC();
+  char Conv_I;
+  float C = I * 2.5;
+  Serial.print( "\n" );
+  Serial.print("Current: ");
+  Serial.println(String("I = ") + C + " A");
+  client.publish("current", String(I).c_str());
+  delay(1000);
+
+  float sensorVoltage;                                     // exhaust sensor
+  float sensorValue;
+  sensorValue = analogRead(A0);                                                     // analog PIN 0 FOR EXHAUST SENSOR
+  sensorVoltage = sensorValue / 1024 * 5.0;
+  Serial.print("Exhaust: ");
+  Serial.print(sensorVoltage);
+  Serial.println(" Kg/sec");
+  client.publish("ex", String(sensorVoltage).c_str());
+  delay(1000);
+
+
+  RunningStatistics inputStats;                             // voltage sensor
+  Sensor = analogRead(3);
+  inputStats.input(Sensor);
+  delay(1000);
+  current_Volts = intercept + slope * inputStats.sigma();
+  current_Volts = current_Volts * (29.75);
+  Serial.print( "Voltage: " );
+  Serial.print( current_Volts );
+  Serial.print(" V");
+  client.publish("volt", String(current_Volts).c_str());
+
+
+  long measurement = TP_init();                    // vibration code
+  delay(1000);
+  Serial.println(" ");
+  Serial.print("Vibration: ");
+  Serial.print(measurement);
+  Serial.print(" mm/s ");
+  client.publish("vibration", String(measurement).c_str());
+
+  Serial.println(" ");
+  Serial.print("Temperature in Deg C: ");                            // temperature codE
+  Serial.println(ktc.readCelsius());
+  client.publish("temperature", String(ktc.readCelsius()).c_str());
+  delay(1000);
+
+
+  //currentTime = millis();                           // FLOW CODE
+  // Every second, calculate and print litres/hour
+  delay(1000);
+  l_hour = (flow_frequency * 60 / 7.5); // (Pulse frequency x 60 min) / 7.5Q = flowrate in L/hour
+  flow_frequency = 0; // Reset Counter
+  Serial.print("Flow: ");
+  Serial.print(l_hour, DEC); // Print litres/hour
+  client.publish("flow", String(l_hour).c_str());
+  Serial.println(" L/hour");
+
+
+  DateTimeParts p = DateTime.getParts();
+  String time_date = String(p.getYear()) + "-" + String( p.getMonth()) + "-" + String( p.getMonthDay()) + "T" + String(  p.getHours()) + ":" + String(  p.getMinutes()) + ":" + String(  p.getSeconds());
+  delay(1000);
+  //////////////////////////////////////
+  if (isStart && DateTime.isTimeValid()) {
+    Serial.println("ADDing to DB");
+
+    sendDataToServer("id", time_date, sensorVoltage, current_Volts, I, l_hour, measurement, 70, millis() / 1000, true);
+    isStart = false;
+    delay(2000);
+    sendDataToServer("id", time_date, sensorVoltage, current_Volts, I, l_hour, measurement, 70, millis() / 1000, false);
+
+  } else if (!isStart && DateTime.isTimeValid()) {
+    Serial.println("Updating");
+    sendDataToServer("id", time_date, sensorVoltage, current_Volts, I, l_hour, measurement, 70, millis() / 1000, isStart);
+  } else {
+    Serial.println("Date&Time Issue");
+  }
+
+
+  ///////////////////////////////////////
+
+  //client.loop();
+
+}
+long TP_init() {
+  delay(1000);
+  long measurement = pulseIn (vibr_Pin, HIGH);
+  return measurement;
+}
+
+void connect()
+{
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(callback);
+
+  while (!client.connected()) {
+    Serial.println("Connecting to MQTT...");
+
+    if (client.connect("ESP8266Client", mqttUser, mqttPassword )) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed with state ");
+      Serial.print(client.state());
+      delay(2000);
+
+    }
+  }
+}
+
+
+void callback(char* topic, byte* payload, unsigned int length) {
+
+  Serial.print("Message arrived in topic: ");
+  Serial.println(topic);
+
+  Serial.print("Message:");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+
+  Serial.println();
+  Serial.println("-----------------------");
+
+}
+
+////////////////////////////////////////////////////////
+void sendDataToServer(String id, String time_date, float vibartion, float volt, float current, float flow, float temperature, float exhaust, long duration, bool isInsert)
+{
+  String sessionID = session_id;
+
+  String serverUrl = "http://mirzashasan95.000webhostapp.com/Webapi/";
+
+
+  if (isInsert) {
+    String url = "saveDataFromNodemcu.php?";
+    String query = "session_id=%22" + sessionID + "%22&device_id=%22" + deviceID + "%22&start_time=%22" + time_date;
+    String sesnorsQuery = "%22&start_flow=" + String(flow) + "&start_temperature=" + String(temperature) + "&start_current=" +
+                          String(current) + "&start_voltage=" + String(volt) + "&start_vibration=" + String(vibartion) + "&start_exhaust=" + String(exhaust);
+    serverUrl = serverUrl + url + query + sesnorsQuery;
+
+  } else if (!isInsert) {
+    String url = "updateDataNodecmu.php?";
+    String query = "session_id=%22" + sessionID + "%22&end_time=%22" + time_date + "%22&duration=%22" + String(duration);
+    String sesnorsQuery = "%22&end_flow=" + String(flow) + "&end_temperature=" + String(temperature) + "&end_current=" +
+                          String(current) + "&end_voltage=" + String(volt) + "&end_vibration=" + String(vibartion) + "&end_exhaust=" + String(exhaust);
+    serverUrl =  serverUrl + url + query + sesnorsQuery;
+  }
+
+
+  Serial.println(serverUrl);
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    http.begin(serverUrl);
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+      Serial.printf("GET... code: %d\n", httpCode);
+    } else {
+      Serial.printf("GET failed, see following error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  }
+  else {
+    Serial.println("WiFi Disconnected");
+  }
+}
+///////////////////////////////////////////////////////////////////////////
